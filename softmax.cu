@@ -18,64 +18,6 @@ constexpr int WARP_SIZE = 32;
 constexpr int BYTES_PER_LDG = 16;
 constexpr int WARPS_PER_CTA = BLOCK_DIM / WARP_SIZE;
 
-// template <typename T>
-// __inline__ __device__ T warpReduceMaxV2(T val) {
-// #pragma unroll
-//     for (int mask = 16; mask > 0; mask >>= 1) {
-//       val = max(val, __shfl_xor_sync(-1, val, mask, 32));
-//     }
-//   return val;
-// }
-
-// template <typename T>
-// __inline__ __device__ T warpReduceSumV2(T val) {
-// #pragma unroll
-//     for (int mask = 16; mask > 0; mask >>= 1) {
-//       val += __shfl_xor_sync(-1, val, mask, 32);
-//     }
-//   return val;
-// }
-
-
-// template <typename T>
-// __inline__ __device__ T blockReduceMaxV2(T val) {
-//   static __shared__ T shared[32];
-//   int lane = threadIdx.x & 0x1f; // in-warp idx
-//   int wid = threadIdx.x >> 5; // warp idx
-//   warpReduceMaxV2<T>(val);
-//   if (lane == 0){ // record in-warp maxx by warp Idx
-//     shared[wid] = *val;
-//   }
-//   __syncthreads();
-
-//   bool is_mask = threadIdx.x < (blockDim.x / 32.f);
-//   *val = is_mask ? shared[lane] : (T)-1e20f;
-  
-//   val = warpReduceMaxV2<T> (val);
-//   return 0.0f;
-// }
-
-// template <typename T>
-// __inline__ __device__ T blockReduceSumV2(T* val) {
-//   static __shared__ T shared[32];
-//   int lane = threadIdx.x & 0x1f; // in-warp idx
-//   int wid = threadIdx.x >> 5; // warp idx
-
-//   warpReduceSumV2<T>(val);
-
-//   if (lane == 0){ // record in-warp maxx by warp Idx
-//     shared[wid] = *val;
-//   }
-//   __syncthreads();
-
-//   bool is_mask = threadIdx.x < (blockDim.x / 32.f);
-//   *val = is_mask ? shared[lane] : (T)(0.0f);
-
-//   warpReduceSumV2<T> (val);
-//   // printf("block %d, thread %d Sum: %f \n",blockIdx.x, threadIdx.x, *val);
-//   return 0.0f;
-// }
-
 __global__ void softmax(float *input, float *output, int M, int N)
 {
     int row = blockIdx.x;
@@ -170,27 +112,7 @@ __global__ void softmax1(float *input, float *output, int M, int N)
     }
     if(threadIdx.x == 0)
       globalMax = val;
-    // for (int i = threadIdx.x; i < N; i += BLOCK_DIM)
-    // {
-    //     val = max(val, input[row * N + i]);
-    // }
-    // tmp[threadIdx.x] = val;
-    // __syncthreads();
 
-    // for (int step = BLOCK_DIM / 2; step > 0; step /= 2)
-    // {
-    //     if (threadIdx.x < step)
-    //     {
-    //         tmp[threadIdx.x] = max(tmp[threadIdx.x], tmp[threadIdx.x + step]);
-    //     }
-    //     __syncthreads();
-    // }
-    // if (threadIdx.x == 0)
-    // {
-    //     globalMax = tmp[0];
-    // }
-
-    //-----------
     val = 0.0f;
     __syncthreads();
     for (int i = threadIdx.x; i < N; i += BLOCK_DIM){
@@ -221,8 +143,103 @@ __global__ void softmax1(float *input, float *output, int M, int N)
         output[row * N + i] = __expf(input[row * N + i] - globalMax) * __fdividef(1.0F, globalSum);
     }
 }
+
 template <typename T, const int VPT, int N, int WARPS_PER_CTA, int BYTES_PER_LDG>
-__launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void softmax_1(
+__global__ void softmax2(float *input, float *output, int M)
+{
+    int row = blockIdx.x;
+    // __shared__ float tmp[BLOCK_DIM];
+    __shared__ float globalMax;
+    __shared__ float globalSum;
+    //-----------
+    float val = -__FLT_MAX__;
+    static __shared__ float shared[32];
+    float vec_r[VPT] __align__(16);
+
+    for (int i = threadIdx.x; i < N; i += BLOCK_DIM * VPT){
+      vec_r[0]= input[row * N + i + 0];
+      vec_r[1]= input[row * N + i + 1];
+      vec_r[2]= input[row * N + i + 2];
+      vec_r[3]= input[row * N + i + 3];
+  // #pragma unroll
+  //       for(int j = 0; j < VPT; ++j){
+  //         vec_r[j]= input[row * N + i + j];
+  //       }
+      val = max(val,vec_r[0]);
+      val = max(val,vec_r[1]);
+      val = max(val,vec_r[2]);
+      val = max(val,vec_r[3]);
+    }
+    
+    __syncthreads();
+    int lane = threadIdx.x & 0x1f; // in-warp idx
+    int wid = threadIdx.x >> 5; // warp idx
+    
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      val = max(val, __shfl_xor_sync(-1, val, mask, 32));
+    }
+
+    if (lane == 0){ // record in-warp maxx by warp Idx
+      shared[wid] = val;
+    }
+
+     __syncthreads();
+
+    bool is_mask = threadIdx.x < (blockDim.x / 32.f);
+    val = is_mask ? shared[lane] : (float) -__FLT_MAX__;
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      val = max(val, __shfl_xor_sync(-1, val, mask, 32));
+    }
+    if(threadIdx.x == 0)
+      globalMax = val;
+
+    val = 0.0f;
+    __syncthreads();
+    for (int i = threadIdx.x; i < N; i += BLOCK_DIM){
+        val += __expf(input[row * N + i] - globalMax);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      val += __shfl_xor_sync(-1, val, mask, 32);
+    }
+
+    if (lane == 0){ // record in-warp maxx by warp Idx
+      shared[wid] = val;
+    }
+     __syncthreads();
+    is_mask = threadIdx.x < (blockDim.x / 32.f);
+    val = is_mask ? shared[lane] : (float) 0.0f;
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      val += __shfl_xor_sync(-1, val, mask, 32);
+    }
+    if(threadIdx.x == 0)
+      globalSum = val;
+
+    __syncthreads();
+# pragma unroll
+    for (int i = threadIdx.x; i < N; i += BLOCK_DIM*VPT){
+      if(VPT * BLOCK_DIM != N){
+        vec_r[0]= input[row * N + i + 0];
+        vec_r[1]= input[row * N + i + 1];
+        vec_r[2]= input[row * N + i + 2];
+        vec_r[3]= input[row * N + i + 3];
+      }
+      output[row * N + i +0] = __expf(vec_r[0] - globalMax) * __fdividef(1.0F, globalSum);
+      output[row * N + i +1] = __expf(vec_r[1] - globalMax) * __fdividef(1.0F, globalSum);
+      output[row * N + i +2] = __expf(vec_r[2] - globalMax) * __fdividef(1.0F, globalSum);
+      output[row * N + i +3] = __expf(vec_r[3] - globalMax) * __fdividef(1.0F, globalSum);
+// #pragma unroll
+//       for(int j = 0;j < VPT ;++j)
+//         output[row * N + i +j] = __expf(vec_r[j] - globalMax) * __fdividef(1.0F, globalSum);
+    }
+}
+
+template <typename T, const int VPT, int N, int WARPS_PER_CTA, int BYTES_PER_LDG>
+__launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void softmax_tg(
     const T* input,
     T* output,
     const int M) {
@@ -374,8 +391,8 @@ void cpu_softmax(float *cpu_input, float *cpu_output, int M)
     int n = N;
      for (int i = 0; i < repeat; i++)
     {
-    softmax1<<<grid_dim, block_dim>>>(input, output, M, n);
-    // softmax_1<float, VPT, N, WARPS_PER_CTA, BYTES_PER_LDG><<<grid_dim, block_dim>>>(input, output, M);
+    softmax2<float, VPT, N, WARPS_PER_CTA, BYTES_PER_LDG><<<grid_dim, block_dim>>>(input, output, M);
+    // softmax_tg<float, VPT, N, WARPS_PER_CTA, BYTES_PER_LDG><<<grid_dim, block_dim>>>(input, output, M);
       // softmax_2<float, N><<<grid_dim, block_dim>>>(input, output, M);
     cudaDeviceSynchronize();
     }
